@@ -862,7 +862,6 @@ class MainGUI():
                 glfw.poll_events()
                 self.input_chars, self.poll_chars = self.poll_chars, self.input_chars
                 self.impl.process_inputs()
-                imagehelper.apply_textures()
                 if self.call_soon:
                     while self.call_soon and (call_soon := self.call_soon.pop(0)):
                         call_soon()
@@ -901,6 +900,7 @@ class MainGUI():
                         or (prev_mouse_pos != mouse_pos and (prev_win_hovered or win_hovered))
                         or prev_scaling != globals.settings.interface_scaling
                         or prev_minimized != self.minimized
+                        or imagehelper.apply_texture_queue
                         or api.session.connector._acquired
                         or prev_focused != self.focused
                         or prev_hidden != self.hidden
@@ -972,10 +972,12 @@ class MainGUI():
                             text = f"Fetching {count} full thread{'s' if count > 1 else ''}..."
                         elif (count := api.fast_checks_counter) > 0:
                             text = f"Validating {count} cached item{'s' if count > 1 else ''}..."
-                        elif api.f95_ratelimit._waiters or api.f95_ratelimit_sleeping.count:
-                            text = f"Waiting for F95zone ratelimit..."
                         elif globals.last_update_check is None:
                             text = "Checking for updates..."
+                        elif (count := imagehelper.astcenc_counter) > 0:
+                            text = "Compressing images..." if count == 1 else f"Compressing {count} frames..."
+                        elif api.f95_ratelimit._waiters or api.f95_ratelimit_sleeping.count:
+                            text = f"Waiting for F95zone ratelimit..."
                         else:
                             text = self.watermark_text
                         _3 = self.scaled(3)
@@ -1021,6 +1023,7 @@ class MainGUI():
                             self.refresh_fonts()
                             self.refresh_styles()
                             async_thread.run(db.update_settings("interface_scaling"))
+                        imagehelper.post_draw()
                     # Wait idle time
                         glfw.swap_buffers(self.window)
                     else:
@@ -2021,16 +2024,33 @@ class MainGUI():
             popup_uuid=popup_uuid
         )
 
-    def draw_game_image_missing_text(self, game: Game, text: str):
-        self.draw_hover_text(
-            text=text,
-            hover_text=(
-                "This image link blocks us! You can blame Imgur." if game.image_url == "blocked" else
-                "This thread does not seem to have an image!" if game.image_url == "missing" else
-                "This image link cannot be reached anymore!" if game.image_url == "dead" else
-                "Run a full refresh to try downloading it again!"
-            )
-        )
+    def draw_game_image_error(self, game: Game, width: float, height: float):
+        if game.image.error == "Image file missing":
+            text = "Image missing!"
+            if game.custom:
+                hover_text = "Right click in More Info popup to add an image."
+            else:
+                hover_text = (
+                    "This image link blocks us! You can blame Imgur." if game.image_url == "blocked" else
+                    "This thread does not seem to have an image!" if game.image_url == "missing" else
+                    "This image link cannot be reached anymore!" if game.image_url == "dead" else
+                    "Run a refresh/recheck to try downloading it again!"
+                )
+        else:
+            text = "Image error!"
+            hover_text = game.image.error or "Unknown error"
+
+        text_size = imgui.calc_text_size(text)
+        if text_size.x >= width:
+            hover_text = f"{text}\n{hover_text}"
+            text = "( ! )"
+            text_size = imgui.calc_text_size(text)
+
+        pos = imgui.get_cursor_pos()
+        imgui.set_cursor_pos((pos.x + (width - text_size.x) / 2, pos.y + (height - text_size.y) / 2))
+        self.draw_hover_text(text=text, hover_text=hover_text)
+        imgui.set_cursor_pos(pos)
+        imgui.dummy(width, height)
 
     def draw_game_info_popup(self, game: Game, carousel_ids: list = None, popup_uuid: str = ""):
         def popup_content():
@@ -2042,23 +2062,12 @@ class MainGUI():
                 avail = avail._replace(x=avail.x + imgui.style.scrollbar_size)
             close_image = False
             zoom_popup = False
-            if image.missing:
-                text = "Image missing!"
-                width = imgui.calc_text_size(text).x
-                imgui.set_cursor_pos_x((avail.x - width + imgui.style.scrollbar_size) / 2)
-                self.draw_game_image_missing_text(game, text)
-            elif image.invalid:
-                text = "Invalid image!"
-                width = imgui.calc_text_size(text).x
-                imgui.set_cursor_pos_x((avail.x - width + imgui.style.scrollbar_size) / 2)
-                self.draw_hover_text(
-                    text=text,
-                    hover_text="This thread's image has an unrecognised format and couldn't be loaded!"
-                )
+            out_height = (min(avail.y, self.scaled(690)) * self.scaled(0.4)) or 1
+            out_width = avail.x or 1
+            if image.error:
+                self.draw_game_image_error(game, out_width, out_height)
             else:
                 aspect_ratio = image.height / image.width
-                out_height = (min(avail.y, self.scaled(690)) * self.scaled(0.4)) or 1
-                out_width = avail.x or 1
                 if aspect_ratio > (out_height / out_width):
                     height = out_height
                     width = height * (1 / aspect_ratio)
@@ -3363,27 +3372,9 @@ class MainGUI():
         rounding = self.scaled(globals.settings.style_corner_radius)
         imgui.begin_group()
         # Image
-        if game.image.missing:
-            text = "Image missing!"
-            text_size = imgui.calc_text_size(text)
+        if game.image.error:
             showed_img = imgui.is_rect_visible(cell_width, img_height)
-            if text_size.x < cell_width:
-                imgui.set_cursor_pos((pos.x + (cell_width - text_size.x) / 2, pos.y + img_height / 2))
-                self.draw_game_image_missing_text(game, text)
-                imgui.set_cursor_pos(pos)
-            imgui.dummy(cell_width, img_height)
-        elif game.image.invalid:
-            text = "Invalid image!"
-            text_size = imgui.calc_text_size(text)
-            showed_img = imgui.is_rect_visible(cell_width, img_height)
-            if text_size.x < cell_width:
-                imgui.set_cursor_pos((pos.x + (cell_width - text_size.x) / 2, pos.y + img_height / 2))
-                self.draw_hover_text(
-                    text=text,
-                    hover_text="This thread's image has an unrecognised format and couldn't be loaded!"
-                )
-                imgui.set_cursor_pos(pos)
-            imgui.dummy(cell_width, img_height)
+            self.draw_game_image_error(game, cell_width, img_height)
         else:
             crop = game.image.crop_to_ratio(globals.settings.cell_image_ratio, fit=globals.settings.fit_images)
             showed_img = game.image.render(cell_width, img_height, *crop, rounding=rounding, flags=imgui.DRAW_ROUND_CORNERS_TOP)
@@ -3838,10 +3829,12 @@ class MainGUI():
         elif self.hovered_game:
             # Hover = show image
             game = self.hovered_game
-            if game.image.missing:
-                imgui.button("Image missing!", width=width, height=height)
-            elif game.image.invalid:
-                imgui.button("Invalid image!", width=width, height=height)
+            if game.image.error:
+                if game.image.error == "Image file missing":
+                    text = "Image missing!"
+                else:
+                    text = "Invalid image!"
+                imgui.button(text, width=width, height=height)
             else:
                 crop = game.image.crop_to_ratio(width / height, fit=globals.settings.fit_images)
                 game.image.render(width, height, *crop, rounding=self.scaled(globals.settings.style_corner_radius))
@@ -4286,6 +4279,44 @@ class MainGUI():
 
             if not set.zoom_enabled:
                 imgui.pop_disabled()
+
+            draw_settings_label(
+                "ASTC compression:",
+                "Compress images using ASTC 6x6/80. Results in dramatically faster image loading and smaller filesize on disk, "
+                "with no perceptible loss in visual quality. Depending on GPU model it might also decrease VRAM usage, or in "
+                "other cases it might not work at all (need more research and feedback on this).\n"
+                "Images are compressed when first shown, and it takes some time, especially so for GIFs. After compressing, the "
+                "result is saved to file, and next loads will be instantaneous.\n"
+                "If you're looking to compare VRAM usage, make sure to restart the tool (fully quit and reopen) between "
+                "measurements. This is because the GPU does not release VRAM until something else needs it, it's just marked "
+                "as unused, which would give the same VRAM usage number between compressed and not.\n"
+                "If only an ASTC image is found it will be used even if this open is disabled (for example, if you enabled "
+                "ASTC replace, the images that have been replaced will continue use the ASTC file even if this setting is off)."
+            )
+            if draw_settings_checkbox("astc_compression"):
+                for image in imagehelper.ImageHelper.instances:
+                    image.loaded = False
+
+            if not set.astc_compression:
+                imgui.push_disabled()
+            draw_settings_label(
+                "ASTC replace:",
+                "Remove original images after ASTC compression. Enabling this is retro-active: it will delete source images for "
+                "ones already compressed as ASTC. Not enabling this option means roughly double disk space usage due to "
+                "duplicate images files."
+            )
+            if draw_settings_checkbox("astc_replace"):
+                for image in imagehelper.ImageHelper.instances:
+                    image.loaded = False
+            if not set.astc_compression:
+                imgui.pop_disabled()
+
+            draw_settings_label(
+                "Unload off-screen:",
+                "Unloads images from VRAM when they are not visible. Will be loaded again when next visible. Only recommended "
+                "to use this together with ASTC compression, otherwise loading images is very slow."
+            )
+            draw_settings_checkbox("unload_offscreen_images")
 
             imgui.end_table()
             imgui.spacing()
