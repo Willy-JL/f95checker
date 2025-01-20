@@ -23,6 +23,7 @@ from PyQt6 import (
     QtWidgets,
 )
 import aiohttp
+import desktop_notifier
 import glfw
 import imgui
 import OpenGL
@@ -48,7 +49,6 @@ from common.structs import (
     TagHighlight,
     TimelineEventType,
     Timestamp,
-    TrayMsg,
     Type,
 )
 from common import parser
@@ -851,7 +851,6 @@ class MainGUI():
                 prev_hidden = self.hidden
                 self.prev_size = size
                 prev_cursor = cursor
-                self.tray.tick_msgs()
                 self.qt_app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents)
                 glfw.make_context_current(self.window)
                 if self.repeat_chars:
@@ -924,13 +923,6 @@ class MainGUI():
                                 shape = glfw.HAND_CURSOR
                             glfw.set_cursor(self.window, glfw.create_standard_cursor(shape))
 
-                        # Updated games popup
-                        if not utils.is_refreshing() and globals.updated_games:
-                            updated_games = globals.updated_games.copy()
-                            globals.updated_games.clear()
-                            sorted_ids = sorted(updated_games, key=lambda id: globals.games[id].type.category.value)
-                            utils.push_popup(self.draw_updates_popup, updated_games, sorted_ids)
-
                         # Start drawing
                         prev_scaling = globals.settings.interface_scaling
                         imgui.new_frame()
@@ -1002,7 +994,7 @@ class MainGUI():
                         # Popups
                         open_popup_count = 0
                         for popup in globals.popup_stack:
-                            opened, closed =  popup()
+                            opened, closed = popup()
                             if closed:
                                 globals.popup_stack.remove(popup)
                             open_popup_count += opened
@@ -1044,7 +1036,7 @@ class MainGUI():
                             elif self.bg_mode_notifs_timer and time.time() > self.bg_mode_notifs_timer:
                                 # Run scheduled notif check
                                 self.bg_mode_notifs_timer = None
-                                utils.start_refresh_task(api.check_notifs(standalone=True), reset_bg_timers=False)
+                                utils.start_refresh_task(api.check_notifs(standalone=True), reset_bg_timers=False, notify_new_games=False)
                     # Wait idle time
                     if self.tray.menu_open:
                         time.sleep(1 / 60)
@@ -1910,7 +1902,7 @@ class MainGUI():
         imgui.spacing()
         imgui.spacing()
 
-    def draw_updates_popup(self, updated_games, sorted_ids, popup_uuid: str = ""):
+    def draw_updates_popup(self, popup_uuid: str = ""):
         def popup_content():
             indent = self.scaled(222)
             width = indent - 3 * imgui.style.item_spacing.x
@@ -1920,11 +1912,11 @@ class MainGUI():
             category_open = False
             imgui.push_text_wrap_pos(full_width)
             imgui.indent(indent)
-            for game_i, id in enumerate(sorted_ids):
+            for game_i, id in enumerate(globals.updated_games_sorted_ids):
                 if id not in globals.games:
-                    sorted_ids.remove(id)
+                    globals.updated_games_sorted_ids.remove(id)
                     continue
-                old_game = updated_games[id]
+                old_game = globals.updated_games[id]
                 game = globals.games[id]
                 if category is not game.type.category:
                     category = game.type.category
@@ -2000,7 +1992,7 @@ class MainGUI():
                 imgui.same_line()
                 self.draw_game_copy_link_button(game, f"{icons.content_copy} Link")
                 imgui.same_line()
-                self.draw_game_more_info_button(game, f"{icons.information_outline} Info", carousel_ids=sorted_ids)
+                self.draw_game_more_info_button(game, f"{icons.information_outline} Info", carousel_ids=globals.updated_games_sorted_ids)
 
                 imgui.end_group()
                 height = imgui.get_item_rect_size().y + imgui.style.item_spacing.y
@@ -2008,18 +2000,22 @@ class MainGUI():
                 imgui.set_cursor_pos((img_pos_x, img_pos_y))
                 game.image.render(width, height, *crop, rounding=self.scaled(globals.settings.style_corner_radius))
 
-                if game_i != len(sorted_ids) - 1:
+                if game_i != len(globals.updated_games_sorted_ids) - 1:
                     imgui.text("\n")
             imgui.unindent(indent)
             imgui.pop_text_wrap_pos()
-        return utils.popup(
-            f"{len(sorted_ids)} update{'' if len(sorted_ids) == 1 else 's'}",
+        opened, closed = utils.popup(
+            f"{len(globals.updated_games_sorted_ids)} update{'' if len(globals.updated_games_sorted_ids) == 1 else 's'}",
             popup_content,
             buttons=True,
             closable=True,
             outside=False,
             popup_uuid=popup_uuid
         )
+        if closed:
+            globals.updated_games_sorted_ids.clear()
+            globals.updated_games.clear()
+        return opened, closed
 
     def draw_game_image_missing_text(self, game: Game, text: str):
         self.draw_hover_text(
@@ -4509,9 +4505,9 @@ class MainGUI():
                         outside=False
                     )
                 if imgui.button("F95 bookmarks", width=-offset):
-                    utils.start_refresh_task(api.import_f95_bookmarks(), reset_bg_timers=False)
+                    utils.start_refresh_task(api.import_f95_bookmarks(), reset_bg_timers=False, notify_new_games=False)
                 if imgui.button("F95 watched threads", width=-offset):
-                    utils.start_refresh_task(api.import_f95_watched_threads(), reset_bg_timers=False)
+                    utils.start_refresh_task(api.import_f95_watched_threads(), reset_bg_timers=False, notify_new_games=False)
                 if imgui.button("Browser bookmarks", width=-offset):
                     def callback(selected):
                         if selected:
@@ -5085,7 +5081,10 @@ class TrayIcon(QtWidgets.QSystemTrayIcon):
         self.main_gui = main_gui
         self.idle_icon = QtGui.QIcon(str(globals.self_path / 'resources/icons/logo.png'))
         self.paused_icon = QtGui.QIcon(str(globals.self_path / 'resources/icons/paused.png'))
-        self.msg_queue: list[TrayMsg] = []
+        self._notify = desktop_notifier.DesktopNotifier(
+            app_name="F95Checker",
+            app_icon=desktop_notifier.Icon(globals.self_path / "resources/icons/icon.png"),
+        )
         super().__init__(self.idle_icon)
 
         self.watermark = QtGui.QAction(f"F95Checker {globals.version_name}")
@@ -5126,7 +5125,6 @@ class TrayIcon(QtWidgets.QSystemTrayIcon):
         self.menu.aboutToShow.connect(self.update_menu)
 
         self.activated.connect(self.activated_filter)
-        self.messageClicked.connect(self.main_gui.show)
 
         self.show()
 
@@ -5193,10 +5191,28 @@ class TrayIcon(QtWidgets.QSystemTrayIcon):
         if reason in self.show_gui_events:
             self.main_gui.show()
 
-    def push_msg(self, title: str, msg: str, icon: QtWidgets.QSystemTrayIcon.MessageIcon):
-        self.msg_queue.append(TrayMsg(title=title, msg=msg, icon=icon))
-
-    def tick_msgs(self):
-        while self.msg_queue:
-            msg = self.msg_queue.pop(0)
-            self.showMessage(msg.title, msg.msg, msg.icon, 5000)
+    def notify(
+        self,
+        title: str,
+        msg: str,
+        urgency=desktop_notifier.Urgency.Normal,
+        icon: desktop_notifier.Icon = None,
+        buttons: list[desktop_notifier.Button] = [],
+        attachment: desktop_notifier.Attachment = None,
+        timeout=5,
+    ):
+        async_thread.run(self._notify.send(
+            title=title,
+            message=msg,
+            urgency=urgency,
+            icon=icon,
+            buttons=buttons + [
+                desktop_notifier.Button(
+                    title="View",
+                    on_pressed=self.main_gui.show,
+                ),
+            ],
+            on_clicked=self.main_gui.show,
+            attachment=attachment,
+            timeout=timeout,
+        ))
